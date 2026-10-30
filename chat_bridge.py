@@ -45,12 +45,14 @@ def handle(h, app):
                     'students':[{k:s[k] for k in ('student_id','name','arrived_at','present')} for s in group['students']]})
             return h.send_json({k:status[k] for k in ('date','total','present','absent')} | {'ok':True,'groups':groups})
         if action=='daily_qr':
-            token=app['daily_qr_token'](refresh=True)
+            date_text=data.get('date','')
+            if not isinstance(date_text,str):raise ValueError('Invalid date')
+            token=app['dated_daily_qr_token'](date_text) if date_text else app['daily_qr_token'](refresh=True)
             url=h.request_base_url()+'/d/'+token
             qr=app['qrcode'].QRCode(error_correction=app['qrcode'].constants.ERROR_CORRECT_M,box_size=12,border=4)
             qr.add_data(url);qr.make(fit=True)
             out=io.BytesIO();qr.make_image(image_factory=app['qrcode'].image.svg.SvgPathImage).save(out)
-            return h.send_json({'ok':True,'svg':out.getvalue().decode(),'url':url,'date':app['today_text']()})
+            return h.send_json({'ok':True,'svg':out.getvalue().decode(),'url':url,'date':date_text,'mode':'fixed' if date_text else 'auto'})
         return h.send_json({'error':'Unknown action'},400)
     except (ValueError,TypeError,KeyError):
         return h.send_json({'error':'リクエストの形式を確認してください。'},400)

@@ -315,8 +315,17 @@ def daily_qr_token(date_text=None,refresh=False,now=None):
         c.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('daily_qr_stable_v1',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(json.dumps(state),now.strftime('%Y-%m-%d %H:%M:%S')))
     return state['token']
 
+def dated_daily_qr_token(date_text):
+    if not isinstance(date_text,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',date_text) or not parse_date_text(date_text):
+        raise ValueError('日付を正しく指定してください。')
+    digest=hmac.new(SECRET,('dated-daily-arrival:'+date_text).encode(),hashlib.sha256).digest()[:18]
+    return 'D'+date_text.replace('-','')+'_'+base64.urlsafe_b64encode(digest).decode().rstrip('=')
+
 def valid_daily_qr_token(token):
-    return bool(token and hmac.compare_digest(str(token).encode(),daily_qr_token().encode()))
+    if not token:return False
+    if re.fullmatch(r'D\d{8}_[A-Za-z0-9_-]{24}',str(token)):
+        return hmac.compare_digest(str(token).encode(),dated_daily_qr_token(today_text()).encode())
+    return hmac.compare_digest(str(token).encode(),daily_qr_token().encode())
 
 def record_daily_arrival(student_id,source='qr'):
     ts=now_text();date=today_text()
@@ -445,9 +454,14 @@ window.addEventListener('focus',()=>input.focus());input.focus();
     return page('学生証バーコード受付',body,js)
 
 
-def daily_qr_print_page(public_base):
-    url=f"{public_base}/d/{daily_qr_token(refresh=True)}"
-    return page('本日の登校QR',f"""<div class='qr-print card'><div class='no-print actions' style='justify-content:center;margin-bottom:12px'><button class='primary' onclick='window.print()'>印刷する</button><a class='btn secondary' href='/teacher'>登校一覧へ</a></div><div class='big'>登校受付 QRコード</div><div class='print-date' style='margin:8px 0;font-size:24px;font-weight:800'>{html.escape(today_text())}</div><img class='qr' src='/teacher/daily-qr.svg' alt='本日のQRコード'><p class='print-note' style='font-size:20px;font-weight:700'>スマートフォンのカメラで読み取ってください</p><p class='small no-print'>{html.escape(url)}</p></div>""")
+def daily_qr_print_page(public_base,date_text=''):
+    token=dated_daily_qr_token(date_text) if date_text else daily_qr_token(refresh=True)
+    url=f'{public_base}/d/{token}'
+    selected=parse_date_text(date_text) if date_text else None
+    label=selected.strftime('%Y年%m月%d日')+'（'+'月火水木金土日'[selected.weekday()]+'）専用' if selected else '共通QR（更新まで有効）'
+    image='/teacher/daily-qr.svg'+('?'+urllib.parse.urlencode({'date':date_text}) if date_text else '')
+    note='このQRは表示した日付だけ出席登録に使えます。事前に印刷できます。' if date_text else '平日14時以降に印刷用画面を開くと更新します。金曜発行分は月曜朝も使えます。'
+    return page('登校QRの表示・印刷',f"""<div class='qr-print card'><div class='no-print'><form method='get' action='/teacher/daily-qr'><label>出席日 <input type='date' name='date' required value='{date_text or today_text()}' style='width:auto' onchange="document.getElementById('qr-print-button').disabled=true;this.form.requestSubmit()"></label><button class='primary'>指定日のQRを表示</button></form><div class='actions' style='justify-content:center;margin-bottom:12px'><button id='qr-print-button' class='primary' onclick='window.print()'>このQRを印刷する</button><a class='btn secondary' href='/teacher/daily-qr'>共通QRに戻す</a><a class='btn secondary' href='/teacher'>登校一覧へ</a></div></div><div class='big'>登校受付 QRコード</div><div class='print-date' style='margin:12px 0;font-size:28px;font-weight:800'>{html.escape(label)}</div><img class='qr' src='{html.escape(image,quote=True)}' alt='{html.escape(label,quote=True)}'><p class='print-note' style='font-size:20px;font-weight:700'>スマートフォンのカメラで読み取ってください</p><p>{html.escape(note)}</p><p class='small no-print'>{html.escape(url)}</p></div>""")
 
 def daily_student_register_page(token,message=''):
     return page('端末登録',f"""<div class='center card'><div class='big'>スマホの初回登録</div><p class='muted'>初回だけ学籍番号を入力してください。次回からはQRを開くだけで登校登録されます。</p>{msgbox(message,'error') if message else ''}<form method='post' action='/student/register/{urllib.parse.quote(token)}'><div class='row'><label>学籍番号</label><input autofocus name='student_id' autocomplete='off' required></div><button class='primary studentbtn' type='submit'>このスマホを登録</button></form></div>""")
@@ -1000,11 +1014,15 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_html(barcode_page())
         if p=='/teacher/daily-qr':
             if not self.require_teacher():return
-            return self.send_html(daily_qr_print_page(self.request_base_url()))
+            try:return self.send_html(daily_qr_print_page(self.request_base_url(),qs.get('date',[''])[0]))
+            except ValueError as exc:return self.send_html(page('日付エラー',msgbox(str(exc),'error')),400)
         if p=='/teacher/daily-qr.svg':
             if not self.require_teacher():return
+            date_text=qs.get('date',[''])[0]
+            try:token=dated_daily_qr_token(date_text) if date_text else daily_qr_token(refresh=True)
+            except ValueError as exc:return self.send_html(page('日付エラー',msgbox(str(exc),'error')),400)
             qr=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=12,border=4)
-            qr.add_data(f'{self.request_base_url()}/d/{daily_qr_token(refresh=True)}');qr.make(fit=True)
+            qr.add_data(f'{self.request_base_url()}/d/{token}');qr.make(fit=True)
             im=qr.make_image(image_factory=qrcode.image.svg.SvgPathImage);o=io.BytesIO();im.save(o);b=o.getvalue()
             self.send_response(200);self.send_header('Content-Type','image/svg+xml');self.send_header('Content-Length',str(len(b)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(b);return
         if p=='/api/daily-status':
