@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+data/
+students.csv
+photos/
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+secret.key

@@ -11,6 +11,7 @@ from xml.etree import ElementTree as ET
 import qrcode
 import qrcode.image.svg
 from gmail_report import start_reporter
+import chat_bridge
 
 APP_DIR=Path(__file__).resolve().parent
 IS_RAILWAY=bool(os.environ.get('RAILWAY_ENVIRONMENT') or os.environ.get('RAILWAY_PROJECT_ID'))
@@ -297,13 +298,25 @@ def record_qr(slug,student_id):
     return ses,already,reg
 
 # ---- v16: one daily arrival scan ----
-def daily_qr_token(date_text=None):
-    date_text=date_text or today_text()
-    digest=hmac.new(SECRET,('daily-arrival:'+date_text).encode(),hashlib.sha256).digest()[:5]
-    return base64.urlsafe_b64encode(digest).decode().rstrip('=')
+def daily_qr_token(date_text=None,refresh=False,now=None):
+    # Explicit date is retained for compatibility with pre-upgrade printed codes.
+    if date_text:
+        digest=hmac.new(SECRET,('daily-arrival:'+date_text).encode(),hashlib.sha256).digest()[:5]
+        return base64.urlsafe_b64encode(digest).decode().rstrip('=')
+    now=now or datetime.now(JST)
+    with db() as c:
+        c.execute('BEGIN IMMEDIATE')
+        row=c.execute("SELECT value FROM app_settings WHERE key='daily_qr_stable_v1'").fetchone()
+        state=json.loads(row['value']) if row else {'token':daily_qr_token(now.date().isoformat()),'issued':''}
+        # A scan never rotates a QR. Only a staff print request after 14:00 on a
+        # weekday does so, at most once that day. Friday's paper survives Monday AM.
+        if refresh and now.weekday()<5 and now.hour>=14 and state['issued']<now.date().isoformat():
+            state={'token':secrets.token_urlsafe(18),'issued':now.date().isoformat()}
+        c.execute("INSERT INTO app_settings(key,value,updated_at) VALUES('daily_qr_stable_v1',?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",(json.dumps(state),now.strftime('%Y-%m-%d %H:%M:%S')))
+    return state['token']
 
 def valid_daily_qr_token(token):
-    return bool(token and hmac.compare_digest(str(token),daily_qr_token()))
+    return bool(token and hmac.compare_digest(str(token).encode(),daily_qr_token().encode()))
 
 def record_daily_arrival(student_id,source='qr'):
     ts=now_text();date=today_text()
@@ -433,7 +446,7 @@ window.addEventListener('focus',()=>input.focus());input.focus();
 
 
 def daily_qr_print_page(public_base):
-    url=f"{public_base}/d/{daily_qr_token()}"
+    url=f"{public_base}/d/{daily_qr_token(refresh=True)}"
     return page('本日の登校QR',f"""<div class='qr-print card'><div class='no-print actions' style='justify-content:center;margin-bottom:12px'><button class='primary' onclick='window.print()'>印刷する</button><a class='btn secondary' href='/teacher'>登校一覧へ</a></div><div class='big'>登校受付 QRコード</div><div class='print-date' style='margin:8px 0;font-size:24px;font-weight:800'>{html.escape(today_text())}</div><img class='qr' src='/teacher/daily-qr.svg' alt='本日のQRコード'><p class='print-note' style='font-size:20px;font-weight:700'>スマートフォンのカメラで読み取ってください</p><p class='small no-print'>{html.escape(url)}</p></div>""")
 
 def daily_student_register_page(token,message=''):
@@ -991,7 +1004,7 @@ class Handler(BaseHTTPRequestHandler):
         if p=='/teacher/daily-qr.svg':
             if not self.require_teacher():return
             qr=qrcode.QRCode(error_correction=qrcode.constants.ERROR_CORRECT_M,box_size=12,border=4)
-            qr.add_data(f'{self.request_base_url()}/d/{daily_qr_token()}');qr.make(fit=True)
+            qr.add_data(f'{self.request_base_url()}/d/{daily_qr_token(refresh=True)}');qr.make(fit=True)
             im=qr.make_image(image_factory=qrcode.image.svg.SvgPathImage);o=io.BytesIO();im.save(o);b=o.getvalue()
             self.send_response(200);self.send_header('Content-Type','image/svg+xml');self.send_header('Content-Length',str(len(b)));self.send_header('Cache-Control','no-store');self.end_headers();self.wfile.write(b);return
         if p=='/api/daily-status':
@@ -1078,6 +1091,7 @@ class Handler(BaseHTTPRequestHandler):
         return self.send_html('not found',404)
     def do_POST(self):
         p=urllib.parse.urlparse(self.path).path
+        if p=='/api/chat-bridge':return chat_bridge.handle(self,globals())
         if p=='/teacher/login':
             pw=str(self.form().get('password',''))
             if not TEACHER_PASSWORD:return self.send_html(teacher_login('Railway Variables に TEACHER_PASSWORD を設定してください。'),503)

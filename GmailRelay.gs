@@ -6,6 +6,9 @@ function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
     var props = PropertiesService.getScriptProperties();
+    // Separate authentication for student account messages; attendance reports
+    // retain their existing token, recipients, subject checks and deduplication.
+    if (data.kind === 'student_account') return sendStudentAccount_(data, props);
     var token = props.getProperty('RELAY_TOKEN');
     var recipient = props.getProperty('REPORT_TO');
     var recipients = (recipient || '').split(',').map(function(value) { return value.trim(); });
@@ -46,4 +49,40 @@ function reply_(value) {
 // Run once from the editor to authorize mail sending; does not send any mail.
 function authorizeMail() {
   return MailApp.getRemainingDailyQuota();
+}
+
+// New Script Properties: CHAT_RELAY_TOKEN (32+ random characters),
+// CHAT_BASE_URL (exact https:// school-chat origin, with no trailing slash).
+function sendStudentAccount_(data, props) {
+  var expected = props.getProperty('CHAT_RELAY_TOKEN') || '';
+  var base = (props.getProperty('CHAT_BASE_URL') || '').replace(/\/$/, '');
+  if (expected.length < 32 || !/^https:\/\/[^\s/?#@]+$/.test(base)) return reply_({ok:false,error:'config'});
+  if (typeof data.token !== 'string' || data.token !== expected) return reply_({ok:false,error:'auth'});
+  var path = data.purpose === 'verify' ? '/verify-email' : data.purpose === 'reset' ? '/reset-password' : '';
+  var prefix = base + path + '?token=';
+  if (!path || typeof data.to !== 'string' || data.to.length > 254 ||
+      !/^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/.test(data.to) ||
+      typeof data.url !== 'string' || data.url.indexOf(prefix) !== 0 ||
+      !/^[A-Za-z0-9_-]{40,100}$/.test(data.url.slice(prefix.length)) ||
+      typeof data.request_id !== 'string' || !/^[a-f0-9]{64}$/.test(data.request_id)) {
+    return reply_({ok:false,error:'invalid'});
+  }
+  var lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return reply_({ok:false,error:'busy'});
+  try {
+    var cache = CacheService.getScriptCache();
+    var cacheKey = 'student_mail_' + data.request_id;
+    if (cache.get(cacheKey)) return reply_({ok:true,duplicate:true});
+    var verify = data.purpose === 'verify';
+    var subject = '軽井沢国際日本語学校：' + (verify ? 'メールアドレスの確認' : 'パスワードの再設定');
+    var body = '以下のリンクを開いて' + (verify ? 'メールアドレスを確認' : 'パスワードを再設定') + 'してください。\n\n' + data.url +
+      '\n\n有効期限は' + (verify ? '30' : '15') + '分です。リンクは一度だけ使用できます。心当たりがなければ、このメールは破棄してください。';
+    MailApp.sendEmail({to:data.to,subject:subject,body:body});
+    cache.put(cacheKey, 'sent', 21600);
+    return reply_({ok:true});
+  } catch (error) {
+    return reply_({ok:false,error:'temporary'});
+  } finally {
+    lock.releaseLock();
+  }
 }
