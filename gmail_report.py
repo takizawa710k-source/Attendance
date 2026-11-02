@@ -149,7 +149,13 @@ class Reporter:
                         ON s.student_id=d.student_id AND d.attendance_date=? AND d.arrived_at<=?
                         WHERE s.report_date=? ORDER BY s.class_name,s.student_id""",
                         (date, cutoff, date)).fetchall()
-                    messages = followup_parts(date, rows)
+                    # The frozen 09:00 report has messages only when someone
+                    # arrived by 09:00. Later arrivals must not enable followup.
+                    morning = conn.execute(
+                        'SELECT messages FROM gmail_daily_reports WHERE report_date=?',
+                        (date,)).fetchone()
+                    messages = (followup_parts(date, rows)
+                                if morning and json.loads(morning['messages']) else [])
                 state = 'pending' if messages else 'skipped'
                 conn.execute(f'INSERT INTO {table}(report_date,state,messages,updated_at) VALUES(?,?,?,?)',
                              (date, state, json.dumps(messages, ensure_ascii=False), now.isoformat()))
